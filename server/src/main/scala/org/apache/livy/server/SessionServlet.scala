@@ -17,18 +17,16 @@
 
 package org.apache.livy.server
 
-import java.security.AccessControlException
-import javax.servlet.http.HttpServletRequest
-
-import org.scalatra._
-import scala.concurrent._
-import scala.concurrent.duration._
-
-import org.apache.livy.{LivyConf, Logging}
 import org.apache.livy.rsc.RSCClientFactory
 import org.apache.livy.server.batch.BatchSession
-import org.apache.livy.sessions.{Session, SessionManager}
 import org.apache.livy.sessions.Session.RecoveryMetadata
+import org.apache.livy.sessions.{Session, SessionManager}
+import org.apache.livy.{LivyConf, Logging}
+import org.scalatra._
+
+import javax.servlet.http.HttpServletRequest
+import scala.concurrent._
+import scala.concurrent.duration._
 
 object SessionServlet extends Logging
 
@@ -37,18 +35,17 @@ object SessionServlet extends Logging
  * id parameter in the handler's URI is "id".
  *
  * Type parameters:
- *  S: the session type
+ * S: the session type
  */
 abstract class SessionServlet[S <: Session, R <: RecoveryMetadata](
-    private[livy] val sessionManager: SessionManager[S, R],
-    val livyConf: LivyConf,
-    accessManager: AccessManager)
+                                                                    private[livy] val sessionManager: SessionManager[S, R],
+                                                                    val livyConf: LivyConf,
+                                                                    accessManager: AccessManager)
   extends JsonServlet
-  with ApiVersioningSupport
-  with MethodOverride
-  with UrlGeneratorSupport
-  with GZipSupport
-{
+    with ApiVersioningSupport
+    with MethodOverride
+    with UrlGeneratorSupport
+    with GZipSupport {
   /**
    * Creates a new session based on the current request. The implementation is responsible for
    * parsing the body of the request.
@@ -112,34 +109,46 @@ abstract class SessionServlet[S <: Session, R <: RecoveryMetadata](
       sessionManager.delete(session.id) match {
         case Some(future) =>
           Await.ready(future, Duration.Inf)
-          Ok(ResponseMessage("deleted"))
-
+          Ok(Map("msg" -> "deleted"))
         case None =>
-          NotFound(ResponseMessage(s"Session ${session.id} already stopped."))
+          NotFound(s"Session ${session.id} already stopped.")
       }
     }
   }
 
   def tooManySessions(): Boolean = {
-    val totalChildProceses = RSCClientFactory.childProcesses().get() +
-      BatchSession.childProcesses.get()
+    val totalChildProceses: Int = getProcessCnt
     totalChildProceses >= livyConf.getInt(LivyConf.SESSION_MAX_CREATION)
   }
 
+  private def getProcessCnt = {
+    val totalChildProceses = RSCClientFactory.childProcesses().get() +
+      BatchSession.childProcesses.get()
+    totalChildProceses
+  }
+
   post("/") {
-    synchronized {
-      if (tooManySessions) {
-        BadRequest(ResponseMessage("Rejected, too many sessions are being created!"))
-      } else {
-        val session = sessionManager.register(createSession(request))
-        // Because it may take some time to establish the session, update the last activity
-        // time before returning the session info to the client.
-        session.recordActivity()
-        Created(clientSessionView(session, request),
-          headers = Map("Location" ->
-            (getRequestPathInfo(request) + url(getSession, "id" -> session.id.toString))))
-      }
+    if (tooManySessions) {
+      BadRequest("Rejected, too many sessions are being created!")
+    } else {
+      val session = sessionManager.register(createSession(request))
+      // Because it may take some time to establish the session, update the last activity
+      // time before returning the session info to the client.
+      session.recordActivity()
+      Created(clientSessionView(session, request),
+        headers = Map("Location" ->
+          (getRequestPathInfo(request) + url(getSession, "id" -> session.id.toString))))
     }
+  }
+
+  get("/stats") {
+    val batchCnt = sessionManager.all().filter(_.state.isActive).size
+    val totalCnt = RSCClientFactory.childProcesses().get() + batchCnt
+    Ok(Map(
+      "sessionCnt" -> RSCClientFactory.childProcesses().get(),
+      "batchCnt" -> batchCnt,
+      "totalCnt" -> totalCnt,
+      "max" -> livyConf.getInt(LivyConf.SESSION_MAX_CREATION)))
   }
 
   private def getRequestPathInfo(request: HttpServletRequest): String = {
@@ -151,14 +160,59 @@ abstract class SessionServlet[S <: Session, R <: RecoveryMetadata](
   }
 
   error {
-    case e: IllegalArgumentException => BadRequest(ResponseMessage(e.getMessage))
-    case e: AccessControlException => Forbidden(ResponseMessage(e.getMessage))
+    case e: IllegalArgumentException => BadRequest(e.getMessage)
   }
 
   /**
    * Returns the remote user for the given request. Separate method so that tests can override it.
    */
   protected def remoteUser(req: HttpServletRequest): String = req.getRemoteUser()
+
+  /**
+   * Checks that the request's user can impersonate the target user.
+   *
+   * If the user does not have permission to impersonate, then halt execution.
+   *
+   * @return The user that should be impersonated. That can be the target user if defined, the
+   *         request's user - which may not be defined - otherwise, or `None` if impersonation is
+   *         disabled.
+   */
+  protected def checkImpersonation(
+                                    target: Option[String],
+                                    req: HttpServletRequest): Option[String] = {
+    if (livyConf.getBoolean(LivyConf.IMPERSONATION_ENABLED)) {
+      if (!target.map(hasSuperAccess(_, req)).getOrElse(true)) {
+        halt(Forbidden(s"User '${remoteUser(req)}' not allowed to impersonate '$target'."))
+      }
+      target.orElse(Option(remoteUser(req)))
+    } else {
+      None
+    }
+  }
+
+  /**
+   * Check that the request's user has view access to resources owned by the given target user.
+   */
+  protected def hasViewAccess(target: String, req: HttpServletRequest): Boolean = {
+    val user = remoteUser(req)
+    user == target || accessManager.checkViewPermissions(user)
+  }
+
+  /**
+   * Check that the request's user has modify access to resources owned by the given target user.
+   */
+  protected def hasModifyAccess(target: String, req: HttpServletRequest): Boolean = {
+    val user = remoteUser(req)
+    user == target || accessManager.checkModifyPermissions(user)
+  }
+
+  /**
+   * Check that the request's user has admin access to resources owned by the given target user.
+   */
+  protected def hasSuperAccess(target: String, req: HttpServletRequest): Boolean = {
+    val user = remoteUser(req)
+    user == target || accessManager.checkSuperUser(user)
+  }
 
   /**
    * Performs an operation on the session, without checking for ownership. Operations executed
@@ -172,28 +226,28 @@ abstract class SessionServlet[S <: Session, R <: RecoveryMetadata](
    * session.
    */
   protected def withViewAccessSession(fn: (S => Any)): Any =
-    doWithSession(fn, false, Some(accessManager.hasViewAccess))
+    doWithSession(fn, false, Some(hasViewAccess))
 
   /**
    * Performs an operation on the session, verifying whether the caller has view access of the
    * session.
    */
   protected def withModifyAccessSession(fn: (S => Any)): Any =
-    doWithSession(fn, false, Some(accessManager.hasModifyAccess))
+    doWithSession(fn, false, Some(hasModifyAccess))
 
   private def doWithSession(fn: (S => Any),
-      allowAll: Boolean,
-      checkFn: Option[(String, String) => Boolean]): Any = {
+                            allowAll: Boolean,
+                            checkFn: Option[(String, HttpServletRequest) => Boolean]): Any = {
     val sessionId = params("id").toInt
     sessionManager.get(sessionId) match {
       case Some(session) =>
-        if (allowAll || checkFn.map(_(session.owner, remoteUser(request))).getOrElse(false)) {
+        if (allowAll || checkFn.map(_ (session.owner, request)).getOrElse(false)) {
           fn(session)
         } else {
           Forbidden()
         }
       case None =>
-        NotFound(ResponseMessage(s"Session '$sessionId' not found."))
+        NotFound(s"Session '$sessionId' not found.")
     }
   }
 
